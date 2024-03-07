@@ -23,6 +23,8 @@
 #include <Library/ConfigDataLib.h>
 #include <Library/PchInfoLib.h>
 #include <Library/TcoTimerLib.h>
+#include <Register/Intel/ArchitecturalMsr.h>
+#include <Library/PagingLib.h>
 
 #define UCODE_REGION_BASE   FixedPcdGet32(PcdUcodeBase)
 #define UCODE_REGION_SIZE   FixedPcdGet32(PcdUcodeSize)
@@ -120,6 +122,73 @@ EarlyPlatformDataCheck (
 }
 
 /**
+  CAR created by ACM covers only Initial code region.
+  This function will expand CAR to cover full flash to improve performance.
+
+**/
+VOID
+EFIAPI
+CacheFullFlash (
+  VOID
+)
+{
+  UINT32                            MsrIdx;
+  UINT32                            ImgLen;
+  UINT32                            AdjLen;
+  UINT64                            MskLen;
+  UINT32                            VariableMtrrCount;
+  MSR_IA32_MTRRCAP_REGISTER         MtrrCap;
+  MSR_IA32_MTRR_PHYSMASK_REGISTER   MtrrMaskReg;
+  UINT64                            ValidMtrrAddressMask;
+  UINT8                             PhysicalAddressBits;
+  UINT8                             Index;
+
+  // Enlarge the code cache region to cover full flash.
+  // FSP-T does not allow to enable full flash code cache due to cache size restriction.
+  // Here, MTRR is patched to enable full flash region cache to avoid performance penalty.
+  // However, the SBL code flow should ensure only limited flash regions will be accessed
+  // before FSP TempRamExit() is called. The combined DATA and CODE cache size should satisfy
+  // the BWG requirement.
+  if ((AsmReadMsr64(MSR_BOOT_GUARD_SACM_INFO) & B_BOOT_GUARD_SACM_INFO_NEM_ENABLED) == 0
+      || PcdGetBool (PcdFastBootEnabled)) {
+    MskLen = (AsmReadMsr64(MSR_CACHE_VARIABLE_MTRR_BASE + 1) | (SIZE_4GB - 1)) + 1;
+    MsrIdx = MSR_CACHE_VARIABLE_MTRR_BASE + 1 * 2;
+    ImgLen = PcdGet32(PcdFlashSize);
+    // PCH only decodes max 16MB of SPI flash from the top down to MMIO.
+    if (ImgLen > SIZE_16MB) {
+      ImgLen = SIZE_16MB;
+    }
+    AdjLen = GetPowerOfTwo32(ImgLen);
+    if (ImgLen > AdjLen) {
+      AdjLen <<= 1;
+    }
+    AsmWriteMsr64(MsrIdx, (SIZE_4GB - AdjLen) | CACHE_WRITEPROTECTED);
+    AsmWriteMsr64(MsrIdx + 1, (MskLen - AdjLen) | B_CACHE_MTRR_VALID);
+
+    // Clear other used MTRRs set by ACM to avoid conflict.
+    if ((AsmReadMsr64(MSR_BOOT_GUARD_SACM_INFO) & B_BOOT_GUARD_SACM_INFO_NEM_ENABLED) == 1) {
+      // Get Valid MTRR Address Mask
+      PhysicalAddressBits  = GetPhysicalAddressBits ();
+      ValidMtrrAddressMask = (LShiftU64((UINT64) 1, PhysicalAddressBits) - 1) & (~(UINT64)0x0FFF);
+      // Current the number of Variable MTRRs
+      MtrrCap.Uint64 = AsmReadMsr64 (MSR_IA32_MTRRCAP);
+      VariableMtrrCount = MtrrCap.Bits.VCNT;
+      for (Index = 2; Index < VariableMtrrCount; Index++) {
+        MsrIdx = MSR_CACHE_VARIABLE_MTRR_BASE + (Index << 1);
+        MtrrMaskReg.Uint64 = AsmReadMsr64 (MsrIdx + 1);
+        MskLen = ~(MtrrMaskReg.Uint64 & ValidMtrrAddressMask) + 1;
+        if (MtrrMaskReg.Bits.V != 0 && MskLen != 0) {
+          // If MtrrMaskReg.V != 0 and length of this MTRR != 0, clear this MTRR.
+          AsmWriteMsr64(MsrIdx, 0);
+          AsmWriteMsr64(MsrIdx + 1, 0);
+        }
+      }
+    }
+
+  }
+}
+
+/**
   Board specific hook points.
 
   Implement board specific initialization during the boot flow.
@@ -135,10 +204,6 @@ BoardInit (
 {
   UINT8                     DebugPort;
   GPIO_INIT_CONFIG          *UartGpioTable;
-  UINT32                    MsrIdx;
-  UINT32                    ImgLen;
-  UINT32                    AdjLen;
-  UINT64                    MskLen;
 
   switch (InitPhase) {
   case PostTempRamInit:
@@ -161,27 +226,9 @@ BoardInit (
     PlatformHookSerialPortInitialize ();
     SerialPortInitialize ();
 
-    // Enlarge the code cache region to cover full flash for non-BootGuard case only
-    if ((AsmReadMsr64(MSR_BOOT_GUARD_SACM_INFO) & B_BOOT_GUARD_SACM_INFO_NEM_ENABLED) == 0) {
-      // FSP-T does not allow to enable full flash code cache due to cache size restriction.
-      // Here, MTRR is patched to enable full flash region cache to avoid performance penalty.
-      // However, the SBL code flow should ensure only limited flash regions will be accessed
-      // before FSP TempRamExit() is called. The combined DATA and CODE cache size should satisfy
-      // the BWG requirement.
-      MskLen = (AsmReadMsr64(MSR_CACHE_VARIABLE_MTRR_BASE + 1) | (SIZE_4GB - 1)) + 1;
-      MsrIdx = MSR_CACHE_VARIABLE_MTRR_BASE + 1 * 2;
-      ImgLen = PcdGet32(PcdFlashSize);
-      // PCH only decodes max 16MB of SPI flash from the top down to MMIO.
-      if (ImgLen > SIZE_16MB) {
-        ImgLen = SIZE_16MB;
-      }
-      AdjLen = GetPowerOfTwo32(ImgLen);
-      if (ImgLen > AdjLen) {
-        AdjLen <<= 1;
-      }
-      AsmWriteMsr64(MsrIdx, (SIZE_4GB - AdjLen) | CACHE_WRITEPROTECTED);
-      AsmWriteMsr64(MsrIdx + 1, (MskLen - AdjLen) | B_CACHE_MTRR_VALID);
-    }
+    // Enlarge the code cache region to cover full flash for non-BootGuard case or fast boot enabled
+    CacheFullFlash ();
+
     break;
   default:
     break;
